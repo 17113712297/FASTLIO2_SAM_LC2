@@ -1,6 +1,6 @@
 #include "lio_builder/lio_builder.h"
 
-// #include <chrono>
+#include <chrono>
 namespace fastlio
 {
     /**
@@ -98,14 +98,25 @@ namespace fastlio
             return;
         }
 
+        auto t0 = std::chrono::steady_clock::now();
         trimMap();
-        // auto tic = std::chrono::system_clock::now();
+        auto t1 = std::chrono::steady_clock::now();
         double solve_H_time = 0;
         kf_->update_iterated_dyn_share_modified(0.001, solve_H_time);
-        // auto toc = std::chrono::system_clock::now();
-        // std::chrono::duration<double> duration = toc - tic;
-        // std::cout << duration.count() * 1000 << std::endl;
+        auto t2 = std::chrono::steady_clock::now();
         increaseMap();
+        auto t3 = std::chrono::steady_clock::now();
+
+        double trim_ms   = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        double ekf_ms    = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        double inc_ms    = std::chrono::duration<double, std::milli>(t3 - t2).count();
+        double total_ms  = std::chrono::duration<double, std::milli>(t3 - t0).count();
+        ROS_INFO_THROTTLE(1.0, "[DIAG] trim=%.1fms  ekf=%.1fms  inc=%.1fms  total=%.1fms",
+                          trim_ms, ekf_ms, inc_ms, total_ms);
+        if (total_ms > 40.0)
+            ROS_WARN("[DIAG] SLOW FRAME: trim=%.1fms  ekf=%.1fms  inc=%.1fms  total=%.1fms",
+                     trim_ms, ekf_ms, inc_ms, total_ms);
+
     }
 
     /**
@@ -316,6 +327,20 @@ namespace fastlio
             ROS_INFO("NO Effective Points!");
             return;
         }
+        // ===== DIAG =====
+        static int call_count = 0;
+        static double last_log_time = 0;
+        call_count++;
+        double now = ros::Time::now().toSec();
+        if (now - last_log_time >= 1.0)
+        {
+            ROS_INFO("[DIAG] effect_feat_num=%d / total=%d  iter_call=%d",
+                     effect_feat_num, size, call_count);
+            call_count = 0;
+            last_log_time = now;
+        }
+        // ===== DIAG END =====
+
 
         share_data.h_x = Eigen::MatrixXd::Zero(effect_feat_num, 12);
         share_data.h.resize(effect_feat_num);

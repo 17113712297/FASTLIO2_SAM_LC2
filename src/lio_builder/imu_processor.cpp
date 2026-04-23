@@ -116,6 +116,14 @@ namespace fastlio
             acc_val = 0.5 * (head.acc + head.acc);
             // normalize acc
             acc_val = acc_val * G_m_s2 / mean_acc_.norm();
+            // ===== DIAG =====
+            // 观察 head.acc 与 tail.acc 差值，若运动时差异很大说明 Bug 影响显著
+            Eigen::Vector3d acc_diff = head.acc - tail.acc;
+            ROS_INFO_THROTTLE(1.0, "[DIAG] acc head=(%.3f,%.3f,%.3f)  tail=(%.3f,%.3f,%.3f)  diff_norm=%.4f",
+                            head.acc(0), head.acc(1), head.acc(2),
+                            tail.acc(0), tail.acc(1), tail.acc(2),
+                            acc_diff.norm());
+            // ===== DIAG END =====
 
             if (head.timestamp < last_lidar_time_end_)
                 dt = tail.timestamp - last_lidar_time_end_;

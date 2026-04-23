@@ -1,6 +1,10 @@
 #include <thread>
 #include <csignal>
+#include <chrono>
+#include <atomic>
 #include <ros/ros.h>
+#include <std_msgs/Float32MultiArray.h>
+
 #include "localizer/icp_localizer.h"
 #include "lio_builder/lio_builder.h"
 #include <tf2_ros/transform_broadcaster.h>
@@ -15,7 +19,13 @@
 #include "fastlio/SlamHold.h"
 #include "fastlio/SlamStart.h"
 #include "fastlio/SlamRelocCheck.h"
-
+// ===== LATENCY DIAG HELPERS =====
+static inline double wall_sec()
+{
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// ================================
 bool terminate_flag = false;
 
 void signalHandler(int signum)
@@ -43,6 +53,15 @@ struct SharedData
 
     bool reset_flag = false;
     bool halt_flag = false;
+
+    // ===== ICP 诊断字段 =====
+    double icp_last_score    = -1.0;
+    double icp_last_align_ms = 0.0;
+    int    icp_success_count = 0;
+    int    icp_fail_count    = 0;
+    double sensor_time_at_icp  = 0.0;  // ICP最近一次使用的传感器时间戳
+    double sensor_time_latest  = 0.0;  // 主线程最新传感器时间戳
+    // ========================
 };
 
 class LocalizerThread
@@ -72,6 +91,13 @@ public:
     {
         current_cloud_.reset(new pcl::PointCloud<pcl::PointXYZI>);
 
+        // ===== ICP线程诊断变量 =====
+        double icp_rate_window_start = wall_sec();
+        int    icp_call_in_window    = 0;
+        int    icp_call_total        = 0;
+        double sensor_time_snap      = 0.0;
+        // ===========================
+
         while (ros::ok())
         {
             rate_->sleep();
@@ -95,9 +121,15 @@ public:
                 init_guess.block<3, 3>(0, 0) = shared_data_->offset_rot * local_rot_;
                 init_guess.block<3, 1>(0, 3) = shared_data_->offset_rot * local_pos_ + shared_data_->offset_pos;
                 pcl::copyPointCloud(*shared_data_->cloud, *current_cloud_);
+                sensor_time_snap = shared_data_->sensor_time_latest; // 记录使用的传感器时间
             }
 
+            // ===== ICP 开始计时 =====
+            double icp_t0 = wall_sec();
+            // ========================
+
             if (shared_data_->service_called)
+
             {
                 std::lock_guard<std::mutex> lock(shared_data_->service_mutex);
                 shared_data_->service_called = false;
@@ -125,6 +157,41 @@ public:
                 else
                     rectify = false;
             }
+
+            // ===== ICP完成，记录诊断 =====
+            double icp_elapsed_ms = (wall_sec() - icp_t0) * 1000.0;
+            icp_call_total++;
+            icp_call_in_window++;
+            {
+                std::lock_guard<std::mutex> lock(shared_data_->main_mutex);
+                shared_data_->icp_last_align_ms  = icp_elapsed_ms;
+                shared_data_->icp_last_score     = icp_localizer_->getScore();
+                shared_data_->sensor_time_at_icp = sensor_time_snap;
+                if (rectify) shared_data_->icp_success_count++;
+                else         shared_data_->icp_fail_count++;
+            }
+            // ICP线程每5秒打印汇总
+            {
+                double now_w = wall_sec();
+                double window = now_w - icp_rate_window_start;
+                if (window >= 5.0)
+                {
+                    ROS_INFO("[ICP_DIAG] ICP线程: 实际频率=%.2fHz  本次耗时=%.1fms  "
+                             "得分=%.4f  成功=%d  失败=%d  总调用=%d",
+                             icp_call_in_window / window,
+                             icp_elapsed_ms,
+                             icp_localizer_->getScore(),
+                             shared_data_->icp_success_count,
+                             shared_data_->icp_fail_count,
+                             icp_call_total);
+                    if (!rectify)
+                        ROS_WARN("[ICP_DIAG] ICP对齐失败！得分=%.4f  耗时=%.1fms",
+                                 icp_localizer_->getScore(), icp_elapsed_ms);
+                    icp_rate_window_start = now_w;
+                    icp_call_in_window    = 0;
+                }
+            }
+            // =============================
 
             if (rectify)
             {
@@ -188,7 +255,7 @@ public:
         nh_.param<bool>("lio_builder/align_gravity", lio_params_.align_gravity, true);
         nh_.param<std::vector<double>>("lio_builder/imu_ext_rot", lio_params_.imu_ext_rot, std::vector<double>());
         nh_.param<std::vector<double>>("lio_builder/imu_ext_pos", lio_params_.imu_ext_pos, std::vector<double>());
-        
+
         nh_.param<double>("localizer/refine_resolution", localizer_params_.refine_resolution, 0.2);
         nh_.param<double>("localizer/rough_resolution", localizer_params_.rough_resolution, 0.5);
         nh_.param<double>("localizer/refine_iter", localizer_params_.refine_iter, 5);
@@ -210,10 +277,14 @@ public:
     {
         local_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("local_cloud", 1000);
         body_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("body_cloud", 1000);
-        odom_pub_ = nh_.advertise<nav_msgs::Odometry>("slam_odom", 1000);
+        odom_pub_ = nh_.advertise<nav_msgs::Odometry>("Odometry", 1000);
+        global_odom_pub_ = nh_.advertise<nav_msgs::Odometry>("Odometry_global", 1000);  // 纠正后的全局Odometry
         map_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("map_cloud", 1000);
+        // ===== 诊断话题 =====
+        latency_diag_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("latency_diag", 10);
+        // ====================
     }
-
+    
     bool relocCallback(fastlio::SlamReLoc::Request &req, fastlio::SlamReLoc::Response &res)
     {
         std::string map_path = req.pcd_path;
@@ -326,10 +397,22 @@ public:
 
     void run()
     {
+        // ===== 主循环延迟诊断变量 =====
+        double last_diag_wall  = wall_sec();
+        int    frame_count     = 0;
+        double total_lag_ms    = 0.0;
+        double max_lag_ms      = 0.0;
+        double total_iter_ms   = 0.0;
+        int    slow_frame_count= 0;
+        // ==============================
+
         while (ros::ok())
         {
+            double iter_t0 = wall_sec();  // 本帧开始时间
+
             local_rate_->sleep();
             ros::spinOnce();
+
             if (terminate_flag)
                 break;
             if (!measure_group_.syncPackage(imu_data_, livox_data_))
@@ -349,9 +432,100 @@ public:
             lio_builder_->mapping(measure_group_);
             if (lio_builder_->currentStatus() == fastlio::Status::INITIALIZE)
                 continue;
+
             current_time_ = measure_group_.lidar_time_end;
             current_state_ = lio_builder_->currentState();
             current_cloud_body_ = lio_builder_->cloudUndistortedBody();
+
+            // ===== 传感器时间滞后计算 =====
+            {
+                double wall_now      = wall_sec();
+                double ros_now_sec   = ros::Time::now().toSec();
+                double lag_ms        = (ros_now_sec - current_time_) * 1000.0;
+                double iter_ms       = (wall_now - iter_t0) * 1000.0;
+
+                frame_count++;
+                total_lag_ms  += lag_ms;
+                total_iter_ms += iter_ms;
+                if (lag_ms  > max_lag_ms) max_lag_ms = lag_ms;
+                if (iter_ms > 40.0)       slow_frame_count++;
+
+                // 更新最新传感器时间给ICP线程参考
+                {
+                    std::lock_guard<std::mutex> lock(shared_date_->main_mutex);
+                    shared_date_->sensor_time_latest = current_time_;
+                }
+
+                // 每5秒打印一次汇总
+                if (wall_now - last_diag_wall >= 5.0)
+                {
+                    double avg_lag   = total_lag_ms  / frame_count;
+                    double avg_iter  = total_iter_ms / frame_count;
+                    double actual_hz = frame_count / (wall_now - last_diag_wall);
+
+                    double icp_score_s, icp_ms_s, icp_st_s;
+                    int    icp_succ_s, icp_fail_s;
+                    {
+                        std::lock_guard<std::mutex> lk(shared_date_->main_mutex);
+                        icp_score_s = shared_date_->icp_last_score;
+                        icp_ms_s    = shared_date_->icp_last_align_ms;
+                        icp_st_s    = shared_date_->sensor_time_at_icp;
+                        icp_succ_s  = shared_date_->icp_success_count;
+                        icp_fail_s  = shared_date_->icp_fail_count;
+                    }
+                    double icp_stale_ms = (current_time_ - icp_st_s) * 1000.0;
+
+                    ROS_INFO("========== [延迟诊断 5s汇总] ==========");
+                    ROS_INFO("[主线程] 实际Hz=%.1f  均帧耗时=%.1fms  慢帧=%d/%d",
+                             actual_hz, avg_iter, slow_frame_count, frame_count);
+                    ROS_INFO("[时间滞后] 传感器落后ROS时间: 均值=%.1fms  最大=%.1fms",
+                             avg_lag, max_lag_ms);
+                    if (avg_lag > 100.0)
+                        ROS_WARN("[时间滞后] !! 均值>100ms，队列严重积压，定位有明显延迟!!");
+                    else if (avg_lag > 33.0)
+                        ROS_WARN("[时间滞后] 均值>33ms（超过1帧），轻度积压");
+                    ROS_INFO("[ICP线程] 得分=%.4f  耗时=%.1fms  成功=%d  失败=%d",
+                             icp_score_s, icp_ms_s, icp_succ_s, icp_fail_s);
+                    ROS_INFO("[ICP线程] 数据陈旧度=%.1fms（ICP点云距现在多久）", icp_stale_ms);
+                    if (icp_stale_ms > 2000.0)
+                        ROS_WARN("[ICP线程] !! ICP修正用的点云已陈旧%.1fms !!", icp_stale_ms);
+                    ROS_INFO("[缓冲区] IMU=%zu  LiDAR=%zu",
+                             imu_data_.buffer.size(), livox_data_.buffer.size());
+                    if (livox_data_.buffer.size() > 2)
+                        ROS_WARN("[缓冲区] LiDAR积压%zu帧！主循环严重跟不上！",
+                                 livox_data_.buffer.size());
+                    ROS_INFO("=========================================");
+
+                    // 重置窗口
+                    last_diag_wall   = wall_now;
+                    frame_count      = 0;
+                    total_lag_ms     = max_lag_ms = total_iter_ms = 0.0;
+                    slow_frame_count = 0;
+                }
+
+                // 每帧发布到 /latency_diag 供 rqt_plot 使用
+                if (latency_diag_pub_.getNumSubscribers() > 0)
+                {
+                    double icp_stale_pub = (current_time_ - shared_date_->sensor_time_at_icp) * 1000.0;
+                    std_msgs::Float32MultiArray dmsg;
+                    // [0]=传感器lag_ms [1]=LiDAR缓冲帧数 [2]=IMU缓冲帧数
+                    // [3]=ICP得分      [4]=ICP耗时ms     [5]=ICP陈旧度ms
+                    // [6]=ICP成功次数  [7]=ICP失败次数
+                    dmsg.data = {
+                        (float)lag_ms,
+                        (float)livox_data_.buffer.size(),
+                        (float)imu_data_.buffer.size(),
+                        (float)shared_date_->icp_last_score,
+                        (float)shared_date_->icp_last_align_ms,
+                        (float)icp_stale_pub,
+                        (float)shared_date_->icp_success_count,
+                        (float)shared_date_->icp_fail_count
+                    };
+                    latency_diag_pub_.publish(dmsg);
+                }
+            }
+            // ==============================
+
             {
                 std::lock_guard<std::mutex> lock(shared_date_->main_mutex);
                 shared_date_->local_rot = current_state_.rot.toRotationMatrix();
@@ -378,6 +552,26 @@ public:
                                        local_frame_,
                                        body_frame_,
                                        current_time_));
+
+            // 发布全局纠正后的Odometry
+            {
+                // 计算全局位姿: global = offset × local
+                Eigen::Matrix3d global_rot = offset_rot_ * current_state_.rot.toRotationMatrix();
+                Eigen::Vector3d global_pos = offset_rot_ * current_state_.pos + offset_pos_;
+
+                nav_msgs::Odometry global_odom = eigen2Odometry(global_rot,
+                                                                 global_pos,
+                                                                 global_frame_,
+                                                                 body_frame_,
+                                                                 current_time_);
+
+                // 只有激活全局定位时才发布（避免发布错误数据）
+                if (shared_date_->localizer_activate && global_odom_pub_.getNumSubscribers() > 0)
+                {
+                    global_odom_pub_.publish(global_odom);
+                }
+            }
+
             publishCloud(body_cloud_pub_,
                          pcl2msg(current_cloud_body_,
                                  body_frame_,
@@ -432,13 +626,18 @@ private:
 
     ros::Publisher odom_pub_;
 
+    ros::Publisher global_odom_pub_;  // 纠正后的全局Odometry发布器
+
     ros::Publisher body_cloud_pub_;
 
     ros::Publisher local_cloud_pub_;
 
     ros::Publisher map_cloud_pub_;
 
+    ros::Publisher latency_diag_pub_;  // /latency_diag
+
     ros::ServiceServer reloc_server_;
+
 
     ros::ServiceServer map_convert_server_;
 

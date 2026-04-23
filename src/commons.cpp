@@ -169,6 +169,18 @@ bool MeasureGroup::syncPackage(ImuData &imu_data, LivoxData &livox_data)
         lidar_time_begin = livox_data.time_buffer.front();
         lidar_time_end = lidar_time_begin + lidar->points.back().curvature / double(1000);
         lidar_pushed = true;
+        // ===== DIAG =====
+        double max_curv = 0.0;
+        for (const auto &pt : lidar->points)
+            max_curv = std::max(max_curv, (double)pt.curvature);
+        double time_end_by_max = lidar_time_begin + max_curv / double(1000);
+        if (std::fabs(time_end_by_max - lidar_time_end) > 0.002)
+            ROS_WARN("[DIAG] lidar_time_end偏差: back=%.4fms  max=%.4fms  diff=%.4fms",
+                     lidar->points.back().curvature,
+                     max_curv,
+                     (time_end_by_max - lidar_time_end) * 1000.0);
+        // ===== DIAG END =====
+
     }
 
     if (imu_data.last_timestamp < lidar_time_end)

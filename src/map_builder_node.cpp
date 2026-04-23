@@ -463,7 +463,7 @@ public:
     {
         local_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("local_cloud", 1000);
         body_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("body_cloud", 1000);
-        odom_pub_ = nh_.advertise<nav_msgs::Odometry>("slam_odom", 1000);
+        odom_pub_ = nh_.advertise<nav_msgs::Odometry>("Odometry", 1000);
         loop_mark_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("loop_mark", 1000);
 
         local_path_pub_ = nh_.advertise<nav_msgs::Path>("local_path", 1000);
